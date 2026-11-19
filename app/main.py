@@ -1,5 +1,6 @@
 import os
 import logging
+import re
 import smtplib
 from contextlib import asynccontextmanager
 from email.message import EmailMessage
@@ -451,6 +452,12 @@ def _award_achievements(user: User, session: Session):
         ("seven_day_streak", "Steady Adventurer", "Complete a quest on seven consecutive days.", seven_day_streak),
         ("monthly_quest", "Long Game", "Complete a monthly quest.", any(q.timeframe == "monthly" for q in completed_quests)),
     ]
+    category_counts = {}
+    for quest in completed_quests: category_counts[quest.category] = category_counts.get(quest.category, 0) + 1
+    for category, count in category_counts.items():
+        if count >= 25:
+            slug = re.sub(r"[^a-z0-9]+", "_", category.lower()).strip("_")[:30]
+            definitions.append((f"category_{slug}", f"{category} devotee", f"Complete 25 quests in {category}.", True))
     for key, name, desc, earned in definitions:
         ach = session.scalar(select(Achievement).where(Achievement.key == key))
         if not ach:
