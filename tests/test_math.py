@@ -35,13 +35,17 @@ def api_client(monkeypatch, tmp_path):
     test_engine.dispose()
 
 
-def test_auth_quest_completion_and_reroll_flow(api_client):
+def test_auth_quest_completion_and_reroll_flow(api_client, caplog):
     from uuid import uuid4
+    import re
+    import logging
     from fastapi.testclient import TestClient
     from app.main import app
 
     email = f"{uuid4().hex}@example.com"
     client = api_client
+    caplog.set_level(logging.INFO, logger="sidequests.auth")
+    assert client.get("/api/quests").status_code == 401
     created = client.post("/api/auth/register", json={"username": "Tester", "email": email, "password": "Long-passphrase-123"})
     assert created.status_code == 201
     assert client.get("/ready").json()["status"] == "ready"
@@ -66,7 +70,11 @@ def test_auth_quest_completion_and_reroll_flow(api_client):
     assert completed.json()["xp_earned"] > 0
     assert client.post(f"/api/quests/{rerolled.json()['replacement_id']}/complete").status_code == 409
     assert client.get("/api/progress/stats").status_code == 200
-    for _ in range(10):
+    assert client.post("/api/auth/forgot-password", json={"email": email}).status_code == 200
+    reset_code = re.search(r"reset code for .*?: (\d{6})", caplog.text).group(1)
+    assert client.post("/api/auth/reset-password", json={"email": email, "code": reset_code, "new_password": "New-passphrase-123"}).status_code == 200
+    assert client.post("/api/auth/login", json={"email": email, "password": "New-passphrase-123"}).status_code == 200
+    for _ in range(9):
         assert client.post("/api/auth/login", json={"email": email, "password": "wrong-password"}).status_code == 401
     assert client.post("/api/auth/login", json={"email": email, "password": "wrong-password"}).status_code == 429
     other_email = f"{uuid4().hex}@example.com"
