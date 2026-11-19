@@ -7,7 +7,7 @@ from email.message import EmailMessage
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from secrets import randbelow
-from hashlib import sha256
+from hmac import compare_digest as hmac_compare_digest, new as hmac_new
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
@@ -23,6 +23,10 @@ DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./sidequests.db")
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {})
 SessionLocal = sessionmaker(engine, expire_on_commit=False)
 passwords = PasswordHash.recommended()
+
+
+def otp_digest(code: str) -> str:
+    return hmac_new(os.getenv("SECRET_KEY", "dev-only-change-me").encode(), code.encode(), "sha256").hexdigest()
 
 
 @asynccontextmanager
@@ -488,7 +492,7 @@ def forgot(data: ForgotInput, request: Request, session: Session = Depends(db_se
         user = session.scalar(select(User).where(User.email == str(email).lower()))
         if user:
             code = f"{randbelow(1_000_000):06d}"
-            session.add(ResetCode(user_id=user.id, digest=sha256(code.encode()).hexdigest(), expires_at=datetime.now(timezone.utc) + timedelta(minutes=10)))
+            session.add(ResetCode(user_id=user.id, digest=otp_digest(code), expires_at=datetime.now(timezone.utc) + timedelta(minutes=10)))
             session.commit()
             if os.getenv("SMTP_HOST"):
                 try:
@@ -512,11 +516,11 @@ def reset_password(data: ResetInput, request: Request, session: Session = Depend
     if not user: raise HTTPException(400, "Invalid or expired reset code")
     rows = session.scalars(select(ResetCode).where(ResetCode.user_id == user.id, ResetCode.used.is_(False)).order_by(ResetCode.id.desc())).all()
     now = datetime.now(timezone.utc)
-    supplied = sha256(data.code.encode()).hexdigest()
+    supplied = otp_digest(data.code)
     for item in rows:
         item.attempts += 1
         expiry = item.expires_at if item.expires_at.tzinfo else item.expires_at.replace(tzinfo=timezone.utc)
-        if item.attempts <= 5 and expiry > now and item.digest == supplied:
+        if item.attempts <= 5 and expiry > now and hmac_compare_digest(item.digest, supplied):
             item.used = True
             user.password_hash = passwords.hash(data.new_password)
             session.commit()
