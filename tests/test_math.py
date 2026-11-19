@@ -27,6 +27,7 @@ def test_auth_quest_completion_and_reroll_flow():
         assert created.status_code == 201
         assert client.get("/ready").json()["status"] == "ready"
         assert client.get("/health").headers["x-frame-options"] == "DENY"
+        assert client.get("/api/quests").json() == []
         assert client.patch("/api/profile", json={"timezone": "Asia/Kolkata", "username": "Quest Tester"}).status_code == 200
         assert client.get("/api/me").json()["timezone"] == "Asia/Kolkata"
         assert client.put("/api/interests", json={"interests": ["Programming", "Fitness", "Reading", "Photography"]}).status_code == 422
@@ -46,6 +47,9 @@ def test_auth_quest_completion_and_reroll_flow():
         assert completed.json()["xp_earned"] > 0
         assert client.post(f"/api/quests/{rerolled.json()['replacement_id']}/complete").status_code == 409
         assert client.get("/api/progress/stats").status_code == 200
+        for _ in range(10):
+            assert client.post("/api/auth/login", json={"email": email, "password": "wrong-password"}).status_code == 401
+        assert client.post("/api/auth/login", json={"email": email, "password": "wrong-password"}).status_code == 429
         other_email = f"{uuid4().hex}@example.com"
         with TestClient(app) as other_client:
             assert other_client.post("/api/auth/register", json={"username": "Other", "email": other_email, "password": "Long-passphrase-456"}).status_code == 201
