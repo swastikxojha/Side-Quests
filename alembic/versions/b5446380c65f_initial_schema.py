@@ -6,7 +6,6 @@ Create Date: 2026-11-19 10:00:22.292943
 """
 from alembic import op
 import sqlalchemy as sa
-from app.main import Base
 
 
 revision = 'b5446380c65f'
@@ -15,7 +14,7 @@ branch_labels = None
 depends_on = None
 
 def upgrade():
-    Base.metadata.create_all(bind=op.get_bind())
+    pass
 
 def downgrade():
-    Base.metadata.drop_all(bind=op.get_bind())
+    pass

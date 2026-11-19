@@ -15,7 +15,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, EmailStr, Field, field_validator
 from pwdlib import PasswordHash
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, UniqueConstraint, create_engine, select
+from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, UniqueConstraint, create_engine, false, select
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 BASE = Path(__file__).parent
@@ -29,10 +29,19 @@ def otp_digest(code: str) -> str:
     return hmac_new(os.getenv("SECRET_KEY", "dev-only-change-me").encode(), code.encode(), "sha256").hexdigest()
 
 
+def otp_ttl_minutes() -> int:
+    try:
+        return max(1, min(60, int(os.getenv("OTP_TTL_MINUTES", "10"))))
+    except ValueError:
+        return 10
+
+
 @asynccontextmanager
 async def lifespan(_app):
-    if os.getenv("APP_ENV", "development") == "production" and (not os.getenv("SECRET_KEY") or os.getenv("SECRET_KEY") == "dev-only-change-me"):
-        raise RuntimeError("Set a strong SECRET_KEY before production startup")
+    secret_key = os.getenv("SECRET_KEY", "")
+    weak_secret_values = {"dev-only-change-me", "replace-with-a-long-random-secret", "changeme", "change-me"}
+    if os.getenv("APP_ENV", "development") == "production" and (len(secret_key) < 32 or secret_key.lower() in weak_secret_values):
+        raise RuntimeError("Set a random SECRET_KEY of at least 32 characters before production startup")
     if os.getenv("APP_ENV", "development") != "production" and os.getenv("APP_AUTO_CREATE_SCHEMA", "true").lower() == "true":
         Base.metadata.create_all(engine)
     with SessionLocal() as session:
@@ -43,6 +52,10 @@ async def lifespan(_app):
 app = FastAPI(title="Side Quests", version="1.0.0", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=BASE / "static"), name="static")
 logger = logging.getLogger("sidequests.auth")
+if os.getenv("APP_ENV", "development") != "production":
+    logger.setLevel(logging.INFO)
+    if not logger.handlers:
+        logger.addHandler(logging.StreamHandler())
 
 
 class Base(DeclarativeBase): pass
@@ -69,6 +82,9 @@ class QuestTemplate(Base):
     estimated_minutes: Mapped[int] = mapped_column(Integer)
     difficulty: Mapped[str] = mapped_column(String(20))
     base_xp: Mapped[int] = mapped_column(Integer)
+    chain_key: Mapped[str | None] = mapped_column(String(50), nullable=True, index=True)
+    sequence_no: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    is_boss: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
 
 
 class Quest(Base):
@@ -95,6 +111,16 @@ class Quest(Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
+class QuestStep(Base):
+    __tablename__ = "quest_steps"
+    __table_args__ = (UniqueConstraint("quest_id", "position", name="uq_quest_step_position"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    quest_id: Mapped[int] = mapped_column(ForeignKey("user_quests.id", ondelete="CASCADE"), index=True)
+    position: Mapped[int] = mapped_column(Integer)
+    title: Mapped[str] = mapped_column(String(160))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 class ResetCode(Base):
     __tablename__ = "reset_codes"
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -114,9 +140,11 @@ class UserInterest(Base):
 
 class XpLedger(Base):
     __tablename__ = "xp_ledger"
+    __table_args__ = (Index("uq_xp_ledger_reference_key", "reference_key", unique=True),)
     id: Mapped[int] = mapped_column(primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
     quest_id: Mapped[int | None] = mapped_column(ForeignKey("user_quests.id", ondelete="SET NULL"), unique=True, nullable=True)
+    reference_key: Mapped[str | None] = mapped_column(String(120), nullable=True)
     amount: Mapped[int] = mapped_column(Integer)
     reason: Mapped[str] = mapped_column(String(50))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
@@ -128,6 +156,7 @@ class Achievement(Base):
     key: Mapped[str] = mapped_column(String(50), unique=True)
     name: Mapped[str] = mapped_column(String(80))
     description: Mapped[str] = mapped_column(String(200))
+    xp_reward: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
 
 
 class UserAchievement(Base):
@@ -321,6 +350,15 @@ def seed_quest_templates(session: Session):
             key = f"starter:{timeframe}:{slot}"
             if not session.scalar(select(QuestTemplate.id).where(QuestTemplate.key == key)):
                 session.add(QuestTemplate(key=key, title=title, description=description, timeframe=timeframe, category="Personal growth", estimated_minutes={"daily": 20, "weekly": 120, "monthly": 600}[timeframe], difficulty="Medium", base_xp=xp))
+    chain_templates = [
+        ("py-project-1", "Start a small Python project", "Set a scope, create the project structure, and build its first working slice.", "weekly", 1, 100, False),
+        ("py-project-2", "Give your project persistent data", "Choose a small data model and save and load real data safely.", "weekly", 2, 130, False),
+        ("py-project-3", "Test and polish your project", "Add useful tests, improve error handling, and make the workflow clear.", "weekly", 3, 160, False),
+        ("py-project-boss", "Publish your complete Python project", "Package, document, and share a finished project you are proud of.", "monthly", 4, 350, True),
+    ]
+    for key, title, description, timeframe, sequence, xp, boss in chain_templates:
+        if not session.scalar(select(QuestTemplate.id).where(QuestTemplate.key == key)):
+            session.add(QuestTemplate(key=key, title=title, description=description, timeframe=timeframe, category="Programming", estimated_minutes=180 if timeframe == "weekly" else 600, difficulty="Epic" if boss else "Hard", base_xp=xp, chain_key="python-project", sequence_no=sequence, is_boss=boss))
     session.commit()
 
 INTEREST_TASKS = {
@@ -374,15 +412,36 @@ def ensure_quests(user: User, session: Session):
         for slot, _ in enumerate(rows):
             if (frame, key, slot) not in existing:
                 interest = interests[slot % len(interests)]
-                title, desc, category, minutes, difficulty, xp = quest_template(interest, frame, slot)
                 template_key = f"starter:{frame}:{slot % len(QUESTS[frame])}"
                 template = session.scalar(select(QuestTemplate).where(QuestTemplate.key == template_key))
-                session.add(Quest(user_id=user.id, template_id=template.id if template else None, title=title, description=desc, timeframe=frame, category=category, estimated_minutes=minutes, difficulty=difficulty, period_key=key, slot=slot, base_xp=xp, due_at=period_due_at(frame, user.timezone)))
+                chain_template = _next_chain_template(user, session, frame) if interest.lower() == "programming" else None
+                if chain_template and slot == 0: template = chain_template
+                if template and template.chain_key:
+                    title, desc, category, minutes, difficulty, xp = template.title, template.description, template.category, template.estimated_minutes, template.difficulty, template.base_xp
+                else:
+                    title, desc, category, minutes, difficulty, xp = quest_template(interest, frame, slot)
+                quest = Quest(user_id=user.id, template_id=template.id if template else None, title=title, description=desc, timeframe=frame, category=category, estimated_minutes=minutes, difficulty=difficulty, period_key=key, slot=slot, base_xp=xp, due_at=period_due_at(frame, user.timezone))
+                session.add(quest); session.flush()
+                if frame in ("weekly", "monthly"):
+                    step_titles = ["Plan the outcome", "Make a focused work session", "Review and improve"] if frame == "weekly" else ["Define the goal", "Make the first piece", "Build the main part", "Review and refine", "Reflect and share"]
+                    session.add_all([QuestStep(quest_id=quest.id, position=i, title=step) for i, step in enumerate(step_titles, 1)])
     # Expire old active assignments and preserve them in history.
     for q in session.scalars(select(Quest).where(Quest.user_id == user.id, Quest.status == "active")).all():
         if q.period_key != period_keys[q.timeframe]: q.status = "expired"
     session.commit()
     return session.scalars(select(Quest).where(Quest.user_id == user.id).order_by(Quest.id.desc())).all()
+
+
+def _next_chain_template(user: User, session: Session, timeframe: str) -> QuestTemplate | None:
+    chain = session.scalars(select(QuestTemplate).where(QuestTemplate.chain_key == "python-project").order_by(QuestTemplate.sequence_no)).all()
+    if not chain: return None
+    completed_ids = {q.template_id for q in session.scalars(select(Quest).where(Quest.user_id == user.id, Quest.status == "completed", Quest.template_id.is_not(None))).all()}
+    for template in chain:
+        if template.id in completed_ids: continue
+        prerequisite = next((item for item in chain if item.sequence_no == (template.sequence_no or 0) - 1), None)
+        if prerequisite and prerequisite.id not in completed_ids: return None
+        return template if template.timeframe == timeframe else None
+    return None
 
 
 @app.get("/api/quests")
@@ -391,13 +450,13 @@ def quests(request: Request, session: Session = Depends(db_session)):
     if not session.scalar(select(UserInterest.id).where(UserInterest.user_id == user.id).limit(1)): return []
     ensure_quests(user, session)
     items = session.scalars(select(Quest).where(Quest.user_id == user.id, Quest.status.in_(["active", "completed"]), Quest.period_key.in_([current_period_key(f, user.timezone) for f in QUESTS])).order_by(Quest.id)).all()
-    return [{"id": q.id, "title": q.title, "description": q.description, "timeframe": q.timeframe, "category": q.category, "estimated_minutes": q.estimated_minutes, "difficulty": q.difficulty, "xp": max(5, q.base_xp // (2 ** q.rerolls)), "status": q.status, "rerolls": q.rerolls, "progress": q.progress, "due_at": q.due_at.isoformat() if q.due_at else None} for q in items]
+    return [{"id": q.id, "title": q.title, "description": q.description, "timeframe": q.timeframe, "category": q.category, "estimated_minutes": q.estimated_minutes, "difficulty": q.difficulty, "xp": max(5, q.base_xp // (2 ** q.rerolls)), "status": q.status, "rerolls": q.rerolls, "progress": q.progress, "due_at": q.due_at.isoformat() if q.due_at else None, "is_boss": bool(q.template_id and session.get(QuestTemplate, q.template_id).is_boss), "steps": [{"id": s.id, "title": s.title, "completed": s.completed_at is not None} for s in session.scalars(select(QuestStep).where(QuestStep.quest_id == q.id).order_by(QuestStep.position)).all()]} for q in items]
 
 
 @app.get("/api/quest-templates")
 def quest_templates(request: Request, session: Session = Depends(db_session)):
     get_user(request, session)
-    return [{"id": t.id, "title": t.title, "description": t.description, "timeframe": t.timeframe, "category": t.category, "estimated_minutes": t.estimated_minutes, "difficulty": t.difficulty, "base_xp": t.base_xp} for t in session.scalars(select(QuestTemplate).order_by(QuestTemplate.timeframe, QuestTemplate.id)).all()]
+    return [{"id": t.id, "title": t.title, "description": t.description, "timeframe": t.timeframe, "category": t.category, "estimated_minutes": t.estimated_minutes, "difficulty": t.difficulty, "base_xp": t.base_xp, "chain_key": t.chain_key, "sequence_no": t.sequence_no, "is_boss": t.is_boss} for t in session.scalars(select(QuestTemplate).order_by(QuestTemplate.timeframe, QuestTemplate.id)).all()]
 
 
 @app.post("/api/quests/{quest_id}/complete")
@@ -406,10 +465,12 @@ def complete(quest_id: int, request: Request, session: Session = Depends(db_sess
     q = session.scalar(select(Quest).where(Quest.id == quest_id, Quest.user_id == user.id))
     if not q: raise HTTPException(404, "Quest not found")
     if q.status != "active": raise HTTPException(409, "Quest is no longer active")
+    steps = session.scalars(select(QuestStep).where(QuestStep.quest_id == q.id)).all()
+    if steps and any(step.completed_at is None for step in steps): raise HTTPException(409, "Complete all quest milestones first")
     reward = max(5, q.base_xp // (2 ** q.rerolls)); q.status = "completed"; q.completed_at = datetime.now(timezone.utc); user.xp += reward
     session.add(XpLedger(user_id=user.id, quest_id=q.id, amount=reward, reason="quest_completion"))
-    _award_achievements(user, session)
-    session.commit(); return {"xp_earned": reward, "total_xp": user.xp, **level_stats(user.xp)}
+    bonus_xp = _award_achievements(user, session)
+    session.commit(); return {"xp_earned": reward, "achievement_xp": bonus_xp, "total_xp": user.xp, **level_stats(user.xp)}
 
 
 @app.post("/api/quests/{quest_id}/reroll")
@@ -424,7 +485,12 @@ def reroll(quest_id: int, request: Request, session: Session = Depends(db_sessio
     pool = QUESTS[q.timeframe]
     candidate = pool[(q.slot + q.generation + q.rerolls) % len(pool)]
     replacement = Quest(user_id=user.id, template_id=q.template_id, title=candidate[0], description=candidate[1], timeframe=q.timeframe, period_key=q.period_key, slot=q.slot, generation=q.generation + 1, difficulty=q.difficulty, base_xp=q.base_xp, rerolls=q.rerolls, due_at=q.due_at, category=q.category, estimated_minutes=q.estimated_minutes)
-    session.add(replacement); session.commit(); session.refresh(replacement)
+    session.add(replacement); session.flush()
+    if q.timeframe == "weekly": titles = ["Plan the outcome", "Make a focused work session", "Review and improve"]
+    elif q.timeframe == "monthly": titles = ["Define the goal", "Make the first piece", "Build the main part", "Review and refine", "Reflect and share"]
+    else: titles = []
+    session.add_all([QuestStep(quest_id=replacement.id, position=i, title=step) for i, step in enumerate(titles, 1)])
+    session.commit(); session.refresh(replacement)
     return {"rerolls": q.rerolls, "xp": new_reward, "replacement_id": replacement.id}
 
 
@@ -433,8 +499,25 @@ def update_progress(quest_id: int, payload: dict, request: Request, session: Ses
     user = get_user(request, session); q = session.scalar(select(Quest).where(Quest.id == quest_id, Quest.user_id == user.id))
     if not q: raise HTTPException(404, "Quest not found")
     if q.status != "active": raise HTTPException(409, "Quest is no longer active")
+    if session.scalar(select(QuestStep.id).where(QuestStep.quest_id == q.id).limit(1)): raise HTTPException(409, "Update individual milestones for this quest")
     q.progress = max(0, min(100, int(payload.get("progress", 0)))); session.commit()
     return {"progress": q.progress}
+
+
+@app.patch("/api/quests/{quest_id}/steps/{step_id}")
+def update_step(quest_id: int, step_id: int, payload: dict, request: Request, session: Session = Depends(db_session)):
+    user = get_user(request, session)
+    quest = session.scalar(select(Quest).where(Quest.id == quest_id, Quest.user_id == user.id))
+    if not quest: raise HTTPException(404, "Quest not found")
+    if quest.status != "active": raise HTTPException(409, "Quest is no longer active")
+    step = session.scalar(select(QuestStep).where(QuestStep.id == step_id, QuestStep.quest_id == quest.id))
+    if not step: raise HTTPException(404, "Milestone not found")
+    step.completed_at = (step.completed_at or datetime.now(timezone.utc)) if payload.get("completed") is True else None
+    session.flush()
+    steps = session.scalars(select(QuestStep).where(QuestStep.quest_id == quest.id)).all()
+    quest.progress = round(100 * sum(s.completed_at is not None for s in steps) / len(steps)) if steps else 0
+    session.commit()
+    return {"progress": quest.progress, "completed": step.completed_at is not None}
 
 
 def _award_achievements(user: User, session: Session):
@@ -450,24 +533,30 @@ def _award_achievements(user: User, session: Session):
             else: break
         seven_day_streak = run >= 7
     definitions = [
-        ("first_quest", "First Steps", "Complete your first quest.", completed >= 1),
-        ("quest_10", "Quest Collector", "Complete ten quests.", completed >= 10),
-        ("quest_100", "Century Club", "Complete one hundred quests.", completed >= 100),
-        ("seven_day_streak", "Steady Adventurer", "Complete a quest on seven consecutive days.", seven_day_streak),
-        ("monthly_quest", "Long Game", "Complete a monthly quest.", any(q.timeframe == "monthly" for q in completed_quests)),
+        ("first_quest", "First Steps", "Complete your first quest.", completed >= 1, 50),
+        ("quest_10", "Quest Collector", "Complete ten quests.", completed >= 10, 100),
+        ("quest_100", "Century Club", "Complete one hundred quests.", completed >= 100, 500),
+        ("seven_day_streak", "Steady Adventurer", "Complete a quest on seven consecutive days.", seven_day_streak, 100),
+        ("monthly_quest", "Long Game", "Complete a monthly quest.", any(q.timeframe == "monthly" for q in completed_quests), 150),
     ]
     category_counts = {}
     for quest in completed_quests: category_counts[quest.category] = category_counts.get(quest.category, 0) + 1
     for category, count in category_counts.items():
         if count >= 25:
             slug = re.sub(r"[^a-z0-9]+", "_", category.lower()).strip("_")[:30]
-            definitions.append((f"category_{slug}", f"{category} devotee", f"Complete 25 quests in {category}.", True))
-    for key, name, desc, earned in definitions:
+            definitions.append((f"category_{slug}", f"{category} devotee", f"Complete 25 quests in {category}.", True, 50))
+    bonus_xp = 0
+    for key, name, desc, earned, xp_reward in definitions:
         ach = session.scalar(select(Achievement).where(Achievement.key == key))
         if not ach:
-            ach = Achievement(key=key, name=name, description=desc); session.add(ach); session.flush()
+            ach = Achievement(key=key, name=name, description=desc, xp_reward=xp_reward); session.add(ach); session.flush()
         if earned and not session.scalar(select(UserAchievement).where(UserAchievement.user_id == user.id, UserAchievement.achievement_id == ach.id)):
             session.add(UserAchievement(user_id=user.id, achievement_id=ach.id))
+            bonus_xp += ach.xp_reward
+            user.xp += ach.xp_reward
+            if ach.xp_reward:
+                session.add(XpLedger(user_id=user.id, reference_key=f"achievement:{user.id}:{ach.id}", amount=ach.xp_reward, reason="achievement_bonus"))
+    return bonus_xp
 
 
 @app.get("/api/history")
@@ -480,7 +569,7 @@ def history(request: Request, session: Session = Depends(db_session)):
 @app.get("/api/achievements")
 def achievements(request: Request, session: Session = Depends(db_session)):
     user=get_user(request,session)
-    return [{"name":a.name,"description":a.description,"unlocked_at":ua.unlocked_at.isoformat()} for ua in session.scalars(select(UserAchievement).where(UserAchievement.user_id==user.id)).all() for a in [session.get(Achievement,ua.achievement_id)]]
+    return [{"name":a.name,"description":a.description,"xp_reward":a.xp_reward,"unlocked_at":ua.unlocked_at.isoformat()} for ua in session.scalars(select(UserAchievement).where(UserAchievement.user_id==user.id)).all() for a in [session.get(Achievement,ua.achievement_id)]]
 
 
 @app.post("/api/auth/forgot-password")
@@ -492,12 +581,13 @@ def forgot(data: ForgotInput, request: Request, session: Session = Depends(db_se
         user = session.scalar(select(User).where(User.email == str(email).lower()))
         if user:
             code = f"{randbelow(1_000_000):06d}"
-            session.add(ResetCode(user_id=user.id, digest=otp_digest(code), expires_at=datetime.now(timezone.utc) + timedelta(minutes=10)))
+            ttl_minutes = otp_ttl_minutes()
+            session.add(ResetCode(user_id=user.id, digest=otp_digest(code), expires_at=datetime.now(timezone.utc) + timedelta(minutes=ttl_minutes)))
             session.commit()
             if os.getenv("SMTP_HOST"):
                 try:
                     message = EmailMessage(); message["Subject"] = "Your Side Quests password reset code"; message["From"] = os.getenv("SMTP_FROM", os.getenv("SMTP_USERNAME", "")); message["To"] = email
-                    message.set_content(f"Your reset code is {code}. It expires in 10 minutes.")
+                    message.set_content(f"Your reset code is {code}. It expires in {ttl_minutes} minutes.")
                     with smtplib.SMTP(os.getenv("SMTP_HOST"), int(os.getenv("SMTP_PORT", "587")), timeout=10) as smtp:
                         smtp.starttls()
                         if os.getenv("SMTP_USERNAME"): smtp.login(os.getenv("SMTP_USERNAME"), os.getenv("SMTP_PASSWORD", ""))
