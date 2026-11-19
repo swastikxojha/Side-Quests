@@ -1,4 +1,5 @@
 import os
+import logging
 import smtplib
 from email.message import EmailMessage
 from datetime import datetime, timedelta, timezone
@@ -13,7 +14,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, EmailStr, Field, field_validator
 from pwdlib import PasswordHash
 from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, UniqueConstraint, create_engine, select
-from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
+from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 BASE = Path(__file__).parent
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./sidequests.db")
@@ -22,6 +23,7 @@ SessionLocal = sessionmaker(engine, expire_on_commit=False)
 passwords = PasswordHash.recommended()
 app = FastAPI(title="Side Quests", version="1.0.0")
 app.mount("/static", StaticFiles(directory=BASE / "static"), name="static")
+logger = logging.getLogger("sidequests.auth")
 
 
 class Base(DeclarativeBase): pass
@@ -250,10 +252,10 @@ def logout(response: Response):
 def me(request: Request, session: Session = Depends(db_session)):
     user = get_user(request, session)
     completed = session.scalars(select(Quest).where(Quest.user_id == user.id, Quest.status == "completed")).all()
-    days = sorted({q.completed_at.date() for q in completed if q.completed_at}, reverse=True)
+    local_zone = ZoneInfo(user.timezone)
+    days = sorted({(q.completed_at if q.completed_at.tzinfo else q.completed_at.replace(tzinfo=timezone.utc)).astimezone(local_zone).date() for q in completed if q.completed_at}, reverse=True)
     streak = 0
     if days:
-        from datetime import date
         local_today = datetime.now(ZoneInfo(user.timezone)).date()
         if days[0] in (local_today, local_today - timedelta(days=1)):
             expected = days[0]
@@ -291,7 +293,6 @@ def quest_template(interest: str, timeframe: str, slot: int):
 
 
 def current_period_key(frame: str, timezone_name: str = "UTC") -> str:
-    from datetime import date
     try: today = datetime.now(ZoneInfo(timezone_name)).date()
     except ZoneInfoNotFoundError: today = datetime.now(timezone.utc).date()
     if frame == "daily": return today.isoformat()
@@ -301,7 +302,7 @@ def current_period_key(frame: str, timezone_name: str = "UTC") -> str:
 
 
 def period_due_at(frame: str, timezone_name: str) -> datetime:
-    from datetime import date, time
+    from datetime import time
     zone = ZoneInfo(timezone_name)
     today = datetime.now(zone).date()
     if frame == "daily": end = today + timedelta(days=1)
@@ -313,7 +314,6 @@ def period_due_at(frame: str, timezone_name: str) -> datetime:
 
 
 def ensure_quests(user: User, session: Session):
-    from datetime import date
     period_keys = {frame: current_period_key(frame, user.timezone) for frame in QUESTS}
     existing = {(q.timeframe, q.period_key, q.slot) for q in session.scalars(select(Quest).where(Quest.user_id == user.id)).all()}
     interests = [i.name for i in session.scalars(select(UserInterest).where(UserInterest.user_id == user.id)).all()] or ["Curiosity"]
@@ -379,7 +379,8 @@ def update_progress(quest_id: int, payload: dict, request: Request, session: Ses
 def _award_achievements(user: User, session: Session):
     completed_quests = session.scalars(select(Quest).where(Quest.user_id == user.id, Quest.status == "completed")).all()
     completed = len(completed_quests)
-    dates = sorted({q.completed_at.date() for q in completed_quests if q.completed_at}, reverse=True)
+    local_zone = ZoneInfo(user.timezone)
+    dates = sorted({(q.completed_at if q.completed_at.tzinfo else q.completed_at.replace(tzinfo=timezone.utc)).astimezone(local_zone).date() for q in completed_quests if q.completed_at}, reverse=True)
     seven_day_streak = False
     if dates:
         expected = dates[0]; run = 0
@@ -427,14 +428,17 @@ def forgot(data: ForgotInput, request: Request, session: Session = Depends(db_se
             session.add(ResetCode(user_id=user.id, digest=sha256(code.encode()).hexdigest(), expires_at=datetime.now(timezone.utc) + timedelta(minutes=10)))
             session.commit()
             if os.getenv("SMTP_HOST"):
-                message = EmailMessage(); message["Subject"] = "Your Side Quests password reset code"; message["From"] = os.getenv("SMTP_FROM", os.getenv("SMTP_USERNAME", "")); message["To"] = email
-                message.set_content(f"Your reset code is {code}. It expires in 10 minutes.")
-                with smtplib.SMTP(os.getenv("SMTP_HOST"), int(os.getenv("SMTP_PORT", "587"))) as smtp:
-                    smtp.starttls()
-                    if os.getenv("SMTP_USERNAME"): smtp.login(os.getenv("SMTP_USERNAME"), os.getenv("SMTP_PASSWORD", ""))
-                    smtp.send_message(message)
+                try:
+                    message = EmailMessage(); message["Subject"] = "Your Side Quests password reset code"; message["From"] = os.getenv("SMTP_FROM", os.getenv("SMTP_USERNAME", "")); message["To"] = email
+                    message.set_content(f"Your reset code is {code}. It expires in 10 minutes.")
+                    with smtplib.SMTP(os.getenv("SMTP_HOST"), int(os.getenv("SMTP_PORT", "587")), timeout=10) as smtp:
+                        smtp.starttls()
+                        if os.getenv("SMTP_USERNAME"): smtp.login(os.getenv("SMTP_USERNAME"), os.getenv("SMTP_PASSWORD", ""))
+                        smtp.send_message(message)
+                except Exception:
+                    logger.exception("Password reset email delivery failed")
             else:
-                print(f"Development password reset code for {email}: {code}")
+                logger.info("Development password reset code for %s: %s", email, code)
     return {"message": "If the account exists, reset instructions have been sent."}
 
 

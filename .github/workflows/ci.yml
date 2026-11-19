@@ -10,4 +10,5 @@ jobs:
           python-version: '3.12'
       - run: pip install -r requirements.txt
       - run: python -m compileall -q app
+      - run: ruff check --select F app tests
       - run: pytest -q

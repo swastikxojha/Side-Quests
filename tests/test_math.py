@@ -34,6 +34,7 @@ def test_auth_quest_completion_and_reroll_flow():
         assert len([q for q in quests if q["timeframe"] == "weekly"]) == 2
         assert len([q for q in quests if q["timeframe"] == "monthly"]) == 1
         original = quests[0]
+        assert original["due_at"] and original["estimated_minutes"] > 0
         rerolled = client.post(f"/api/quests/{original['id']}/reroll")
         assert rerolled.status_code == 200
         assert rerolled.json()["xp"] == original["xp"] // 2
@@ -42,3 +43,7 @@ def test_auth_quest_completion_and_reroll_flow():
         assert completed.json()["xp_earned"] > 0
         assert client.post(f"/api/quests/{rerolled.json()['replacement_id']}/complete").status_code == 409
         assert client.get("/api/progress/stats").status_code == 200
+        other_email = f"{uuid4().hex}@example.com"
+        with TestClient(app) as other_client:
+            assert other_client.post("/api/auth/register", json={"username": "Other", "email": other_email, "password": "Long-passphrase-456"}).status_code == 201
+            assert other_client.post(f"/api/quests/{original['id']}/complete").status_code == 404
