@@ -56,7 +56,7 @@ This checklist follows the original project brief. Items marked **Done** have lo
 - [x] Rebuild Compose image and verify app and PostgreSQL health checks; startup migrations apply cleanly
 - [x] Run PostgreSQL-backed local HTTP checks for auth, reset, ownership, quest lifecycle, profile, history, stats, and delete
 - [x] Update README run/test instructions, backups, deployment settings, and known external setup
-- [ ] Push verified changes to `main`; confirm local tree is clean apart from workspace instructions
+- [x] Push verified changes to `main`; the workspace retains only the untracked `AGENTS.md` instruction file
 
 ## Remaining before a public production launch
 
