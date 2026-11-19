@@ -316,7 +316,8 @@ def period_due_at(frame: str, timezone_name: str) -> datetime:
 def ensure_quests(user: User, session: Session):
     period_keys = {frame: current_period_key(frame, user.timezone) for frame in QUESTS}
     existing = {(q.timeframe, q.period_key, q.slot) for q in session.scalars(select(Quest).where(Quest.user_id == user.id)).all()}
-    interests = [i.name for i in session.scalars(select(UserInterest).where(UserInterest.user_id == user.id)).all()] or ["Curiosity"]
+    interests = [i.name for i in session.scalars(select(UserInterest).where(UserInterest.user_id == user.id)).all()]
+    if not interests: return []
     for frame, rows in QUESTS.items():
         key = period_keys[frame]
         for slot, _ in enumerate(rows):
@@ -334,8 +335,9 @@ def ensure_quests(user: User, session: Session):
 @app.get("/api/quests")
 def quests(request: Request, session: Session = Depends(db_session)):
     user = get_user(request, session)
+    if not session.scalar(select(UserInterest.id).where(UserInterest.user_id == user.id).limit(1)): return []
     ensure_quests(user, session)
-    items = session.scalars(select(Quest).where(Quest.user_id == user.id, Quest.period_key.in_([current_period_key(f, user.timezone) for f in QUESTS])).order_by(Quest.id)).all()
+    items = session.scalars(select(Quest).where(Quest.user_id == user.id, Quest.status.in_(["active", "completed"]), Quest.period_key.in_([current_period_key(f, user.timezone) for f in QUESTS])).order_by(Quest.id)).all()
     return [{"id": q.id, "title": q.title, "description": q.description, "timeframe": q.timeframe, "category": q.category, "estimated_minutes": q.estimated_minutes, "difficulty": q.difficulty, "xp": max(5, q.base_xp // (2 ** q.rerolls)), "status": q.status, "rerolls": q.rerolls, "progress": q.progress, "due_at": q.due_at.isoformat() if q.due_at else None} for q in items]
 
 
@@ -517,4 +519,9 @@ def progress_stats(request: Request, session: Session = Depends(db_session)):
     for frame in QUESTS:
         group = [q for q in quests if q.timeframe == frame]
         summary[frame] = {"assigned": len(group), "completed": sum(q.status == "completed" for q in group), "expired": sum(q.status == "expired" for q in group)}
-    return {"total_xp": user.xp, "levels": level_stats(user.xp), "timeframes": summary, "xp_history": [{"amount": x.amount, "reason": x.reason, "created_at": x.created_at.isoformat()} for x in session.scalars(select(XpLedger).where(XpLedger.user_id == user.id).order_by(XpLedger.id.desc()).limit(50)).all()]}
+    categories = {}
+    for q in quests:
+        bucket = categories.setdefault(q.category, {"assigned": 0, "completed": 0})
+        bucket["assigned"] += 1
+        bucket["completed"] += q.status == "completed"
+    return {"total_xp": user.xp, "levels": level_stats(user.xp), "timeframes": summary, "categories": categories, "xp_history": [{"amount": x.amount, "reason": x.reason, "created_at": x.created_at.isoformat()} for x in session.scalars(select(XpLedger).where(XpLedger.user_id == user.id).order_by(XpLedger.id.desc()).limit(50)).all()]}
