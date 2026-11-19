@@ -1,6 +1,7 @@
 import os
 import logging
 import smtplib
+from contextlib import asynccontextmanager
 from email.message import EmailMessage
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -21,7 +22,20 @@ DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./sidequests.db")
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {})
 SessionLocal = sessionmaker(engine, expire_on_commit=False)
 passwords = PasswordHash.recommended()
-app = FastAPI(title="Side Quests", version="1.0.0")
+
+
+@asynccontextmanager
+async def lifespan(_app):
+    if os.getenv("APP_ENV", "development") == "production" and (not os.getenv("SECRET_KEY") or os.getenv("SECRET_KEY") == "dev-only-change-me"):
+        raise RuntimeError("Set a strong SECRET_KEY before production startup")
+    if os.getenv("APP_ENV", "development") != "production" and os.getenv("APP_AUTO_CREATE_SCHEMA", "true").lower() == "true":
+        Base.metadata.create_all(engine)
+    with SessionLocal() as session:
+        seed_quest_templates(session)
+    yield
+
+
+app = FastAPI(title="Side Quests", version="1.0.0", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=BASE / "static"), name="static")
 logger = logging.getLogger("sidequests.auth")
 
@@ -39,11 +53,25 @@ class User(Base):
     timezone: Mapped[str] = mapped_column(String(64), default="UTC")
 
 
+class QuestTemplate(Base):
+    __tablename__ = "quest_templates"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    key: Mapped[str] = mapped_column(String(80), unique=True, index=True)
+    title: Mapped[str] = mapped_column(String(140))
+    description: Mapped[str] = mapped_column(String(500))
+    timeframe: Mapped[str] = mapped_column(String(10), index=True)
+    category: Mapped[str] = mapped_column(String(40))
+    estimated_minutes: Mapped[int] = mapped_column(Integer)
+    difficulty: Mapped[str] = mapped_column(String(20))
+    base_xp: Mapped[int] = mapped_column(Integer)
+
+
 class Quest(Base):
     __tablename__ = "user_quests"
     __table_args__ = (UniqueConstraint("user_id", "timeframe", "period_key", "slot", "generation", name="uq_user_quest_period_slot"),)
     id: Mapped[int] = mapped_column(primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    template_id: Mapped[int | None] = mapped_column(ForeignKey("quest_templates.id", ondelete="SET NULL"), nullable=True)
     title: Mapped[str] = mapped_column(String(140))
     description: Mapped[str] = mapped_column(String(500))
     timeframe: Mapped[str] = mapped_column(String(10))
@@ -176,20 +204,29 @@ def rate_limit(session: Session, request: Request, action: str, limit: int, seco
     session.commit()
 
 
-@app.on_event("startup")
-def startup():
-    if os.getenv("APP_ENV", "development") == "production" and (not os.getenv("SECRET_KEY") or os.getenv("SECRET_KEY") == "dev-only-change-me"):
-        raise RuntimeError("Set a strong SECRET_KEY before production startup")
-    if os.getenv("APP_ENV", "development") != "production" and os.getenv("APP_AUTO_CREATE_SCHEMA", "true").lower() == "true":
-        Base.metadata.create_all(engine)
-
-
 @app.get("/")
 def home(): return FileResponse(BASE / "static" / "index.html")
 
 
 @app.get("/health")
 def health(): return {"status": "ok"}
+
+
+@app.get("/ready")
+def ready(session: Session = Depends(db_session)):
+    try: session.execute(select(1))
+    except Exception: raise HTTPException(503, "Database is unavailable")
+    return {"status": "ready"}
+
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    return response
 
 
 def get_user(request, session: Session) -> User:
@@ -272,6 +309,15 @@ QUESTS = {
     "monthly": [("Finish and share a personal project", "Build something across several short sessions and reflect on it.", 250)]
 }
 
+
+def seed_quest_templates(session: Session):
+    for timeframe, templates in QUESTS.items():
+        for slot, (title, description, xp) in enumerate(templates):
+            key = f"starter:{timeframe}:{slot}"
+            if not session.scalar(select(QuestTemplate.id).where(QuestTemplate.key == key)):
+                session.add(QuestTemplate(key=key, title=title, description=description, timeframe=timeframe, category="Personal growth", estimated_minutes={"daily": 20, "weekly": 120, "monthly": 600}[timeframe], difficulty="Medium", base_xp=xp))
+    session.commit()
+
 INTEREST_TASKS = {
     "programming": {"daily": ("Solve a small coding challenge", "Practice one concept and note what you learned.", "Learning", 25, "Easy", 35), "weekly": ("Ship a small feature", "Build and document a useful feature in a project.", "Career", 120, "Medium", 100), "monthly": ("Publish a mini application", "Plan, build, test, and share a small complete app.", "Creative", 600, "Hard", 250)},
     "fitness": {"daily": ("Take a 20-minute movement break", "Choose a walk, stretch, or workout that feels good.", "Wellness", 20, "Easy", 35), "weekly": ("Try a new workout", "Pick a new session and reflect on what you enjoyed.", "Wellness", 90, "Medium", 100), "monthly": ("Build a four-week movement routine", "Choose a realistic routine and keep a simple progress log.", "Wellness", 480, "Hard", 250)},
@@ -324,7 +370,9 @@ def ensure_quests(user: User, session: Session):
             if (frame, key, slot) not in existing:
                 interest = interests[slot % len(interests)]
                 title, desc, category, minutes, difficulty, xp = quest_template(interest, frame, slot)
-                session.add(Quest(user_id=user.id, title=title, description=desc, timeframe=frame, category=category, estimated_minutes=minutes, difficulty=difficulty, period_key=key, slot=slot, base_xp=xp, due_at=period_due_at(frame, user.timezone)))
+                template_key = f"starter:{frame}:{slot % len(QUESTS[frame])}"
+                template = session.scalar(select(QuestTemplate).where(QuestTemplate.key == template_key))
+                session.add(Quest(user_id=user.id, template_id=template.id if template else None, title=title, description=desc, timeframe=frame, category=category, estimated_minutes=minutes, difficulty=difficulty, period_key=key, slot=slot, base_xp=xp, due_at=period_due_at(frame, user.timezone)))
     # Expire old active assignments and preserve them in history.
     for q in session.scalars(select(Quest).where(Quest.user_id == user.id, Quest.status == "active")).all():
         if q.period_key != period_keys[q.timeframe]: q.status = "expired"
@@ -339,6 +387,12 @@ def quests(request: Request, session: Session = Depends(db_session)):
     ensure_quests(user, session)
     items = session.scalars(select(Quest).where(Quest.user_id == user.id, Quest.status.in_(["active", "completed"]), Quest.period_key.in_([current_period_key(f, user.timezone) for f in QUESTS])).order_by(Quest.id)).all()
     return [{"id": q.id, "title": q.title, "description": q.description, "timeframe": q.timeframe, "category": q.category, "estimated_minutes": q.estimated_minutes, "difficulty": q.difficulty, "xp": max(5, q.base_xp // (2 ** q.rerolls)), "status": q.status, "rerolls": q.rerolls, "progress": q.progress, "due_at": q.due_at.isoformat() if q.due_at else None} for q in items]
+
+
+@app.get("/api/quest-templates")
+def quest_templates(request: Request, session: Session = Depends(db_session)):
+    get_user(request, session)
+    return [{"id": t.id, "title": t.title, "description": t.description, "timeframe": t.timeframe, "category": t.category, "estimated_minutes": t.estimated_minutes, "difficulty": t.difficulty, "base_xp": t.base_xp} for t in session.scalars(select(QuestTemplate).order_by(QuestTemplate.timeframe, QuestTemplate.id)).all()]
 
 
 @app.post("/api/quests/{quest_id}/complete")
@@ -364,7 +418,7 @@ def reroll(quest_id: int, request: Request, session: Session = Depends(db_sessio
     q.status = "rerolled"
     pool = QUESTS[q.timeframe]
     candidate = pool[(q.slot + q.generation + q.rerolls) % len(pool)]
-    replacement = Quest(user_id=user.id, title=candidate[0], description=candidate[1], timeframe=q.timeframe, period_key=q.period_key, slot=q.slot, generation=q.generation + 1, difficulty="Medium", base_xp=q.base_xp, rerolls=q.rerolls, due_at=q.due_at)
+    replacement = Quest(user_id=user.id, template_id=q.template_id, title=candidate[0], description=candidate[1], timeframe=q.timeframe, period_key=q.period_key, slot=q.slot, generation=q.generation + 1, difficulty=q.difficulty, base_xp=q.base_xp, rerolls=q.rerolls, due_at=q.due_at, category=q.category, estimated_minutes=q.estimated_minutes)
     session.add(replacement); session.commit(); session.refresh(replacement)
     return {"rerolls": q.rerolls, "xp": new_reward, "replacement_id": replacement.id}
 

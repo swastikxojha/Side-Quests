@@ -25,11 +25,14 @@ def test_auth_quest_completion_and_reroll_flow():
     with TestClient(app) as client:
         created = client.post("/api/auth/register", json={"username": "Tester", "email": email, "password": "Long-passphrase-123"})
         assert created.status_code == 201
+        assert client.get("/ready").json()["status"] == "ready"
+        assert client.get("/health").headers["x-frame-options"] == "DENY"
         assert client.patch("/api/profile", json={"timezone": "Asia/Kolkata", "username": "Quest Tester"}).status_code == 200
         assert client.get("/api/me").json()["timezone"] == "Asia/Kolkata"
         assert client.put("/api/interests", json={"interests": ["Programming", "Fitness", "Reading", "Photography"]}).status_code == 422
         assert client.put("/api/interests", json={"interests": ["Programming", "Fitness"]}).status_code == 200
         quests = client.get("/api/quests").json()
+        assert len(client.get("/api/quest-templates").json()) >= 6
         assert len([q for q in quests if q["timeframe"] == "daily"]) == 3
         assert len([q for q in quests if q["timeframe"] == "weekly"]) == 2
         assert len([q for q in quests if q["timeframe"] == "monthly"]) == 1
