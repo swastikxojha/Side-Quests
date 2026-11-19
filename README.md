@@ -8,7 +8,7 @@ Side Quests turns personal interests into daily, weekly, and monthly challenges.
 2. Run `docker compose up --build`.
 3. Open http://localhost:8000. API documentation is at `/docs`.
 
-For a lightweight development run without Docker, create a virtual environment, install `requirements.txt`, then run `uvicorn app.main:app --reload`. With no `DATABASE_URL`, the app uses a local SQLite file for development; production runs on PostgreSQL through Compose. Copy `.env.example` to `.env` first if using Compose.
+For a lightweight development run without Docker, create a virtual environment, install `requirements-dev.txt`, then run `uvicorn app.main:app --reload`. With no `DATABASE_URL`, the app uses a local SQLite file for development; production runs on PostgreSQL through Compose. Copy `.env.example` to `.env` first if using Compose.
 
 The development configuration prints password-reset OTPs to the application log. Configure SMTP before enabling email delivery in production. Never use the development OTP mode in a public deployment. The included Compose database credentials are for local development only; replace them and use a strong `SECRET_KEY` for deployment.
 
