@@ -7,6 +7,15 @@ def test_reroll_halves_xp_and_has_floor():
     assert reward(10, 8) == 5
 
 
+def test_progression_and_interest_quest_catalogue():
+    from app.main import level_stats, quest_template
+    assert level_stats(0)["level"] == 1
+    assert level_stats(500)["level"] == 2
+    assert level_stats(2000)["level"] == 3
+    assert quest_template("Fitness", "daily", 0)[0] == "Take a 20-minute movement break"
+    assert quest_template("Programming", "monthly", 0)[4] == "Hard"
+
+
 def test_auth_quest_completion_and_reroll_flow():
     from uuid import uuid4
     from fastapi.testclient import TestClient

@@ -45,6 +45,8 @@ class Quest(Base):
     title: Mapped[str] = mapped_column(String(140))
     description: Mapped[str] = mapped_column(String(500))
     timeframe: Mapped[str] = mapped_column(String(10))
+    category: Mapped[str] = mapped_column(String(40), default="Personal growth")
+    estimated_minutes: Mapped[int] = mapped_column(Integer, default=20)
     period_key: Mapped[str] = mapped_column(String(20), default="")
     slot: Mapped[int] = mapped_column(Integer, default=0)
     generation: Mapped[int] = mapped_column(Integer, default=0)
@@ -268,6 +270,25 @@ QUESTS = {
     "monthly": [("Finish and share a personal project", "Build something across several short sessions and reflect on it.", 250)]
 }
 
+INTEREST_TASKS = {
+    "programming": {"daily": ("Solve a small coding challenge", "Practice one concept and note what you learned.", "Learning", 25, "Easy", 35), "weekly": ("Ship a small feature", "Build and document a useful feature in a project.", "Career", 120, "Medium", 100), "monthly": ("Publish a mini application", "Plan, build, test, and share a small complete app.", "Creative", 600, "Hard", 250)},
+    "fitness": {"daily": ("Take a 20-minute movement break", "Choose a walk, stretch, or workout that feels good.", "Wellness", 20, "Easy", 35), "weekly": ("Try a new workout", "Pick a new session and reflect on what you enjoyed.", "Wellness", 90, "Medium", 100), "monthly": ("Build a four-week movement routine", "Choose a realistic routine and keep a simple progress log.", "Wellness", 480, "Hard", 250)},
+    "photography": {"daily": ("Make one intentional photograph", "Find a subject and experiment with light or framing.", "Creativity", 20, "Easy", 35), "weekly": ("Complete a photo walk", "Explore a place and select your five favorite photos.", "Adventure", 120, "Medium", 100), "monthly": ("Create a themed photo story", "Collect and edit a small series around one visual theme.", "Creative", 600, "Hard", 250)},
+    "reading": {"daily": ("Read for 20 focused minutes", "Put distractions away and capture one memorable idea.", "Learning", 20, "Easy", 35), "weekly": ("Finish a reading section", "Read a substantial section and write a short reflection.", "Learning", 120, "Medium", 100), "monthly": ("Finish a book and share a review", "Choose a book, make steady progress, then recommend it.", "Learning", 600, "Hard", 250)},
+    "creativity": {"daily": ("Make a tiny creative study", "Spend a short session sketching, writing, or composing.", "Creative", 25, "Easy", 35), "weekly": ("Finish a small creative piece", "Make something complete enough to share with a friend.", "Creative", 150, "Medium", 100), "monthly": ("Build a personal portfolio piece", "Develop one larger piece through several focused sessions.", "Creative", 600, "Hard", 250)},
+}
+
+
+def quest_template(interest: str, timeframe: str, slot: int):
+    match = INTEREST_TASKS.get(interest.lower())
+    if match:
+        title, desc, category, minutes, difficulty, xp = match[timeframe]
+        return title, desc, category, minutes, difficulty, xp
+    defaults = QUESTS[timeframe]
+    title, desc, xp = defaults[slot % len(defaults)]
+    mins = {"daily": 20, "weekly": 120, "monthly": 600}[timeframe]
+    return title, desc, "Personal growth", mins, "Medium", xp
+
 
 def current_period_key(frame: str, timezone_name: str = "UTC") -> str:
     from datetime import date
@@ -298,9 +319,11 @@ def ensure_quests(user: User, session: Session):
     interests = [i.name for i in session.scalars(select(UserInterest).where(UserInterest.user_id == user.id)).all()] or ["Curiosity"]
     for frame, rows in QUESTS.items():
         key = period_keys[frame]
-        for slot, (title, desc, xp) in enumerate(rows):
+        for slot, _ in enumerate(rows):
             if (frame, key, slot) not in existing:
-                session.add(Quest(user_id=user.id, title=title.replace("your", interests[slot % len(interests)]), description=desc, timeframe=frame, period_key=key, slot=slot, base_xp=xp, due_at=period_due_at(frame, user.timezone)))
+                interest = interests[slot % len(interests)]
+                title, desc, category, minutes, difficulty, xp = quest_template(interest, frame, slot)
+                session.add(Quest(user_id=user.id, title=title, description=desc, timeframe=frame, category=category, estimated_minutes=minutes, difficulty=difficulty, period_key=key, slot=slot, base_xp=xp, due_at=period_due_at(frame, user.timezone)))
     # Expire old active assignments and preserve them in history.
     for q in session.scalars(select(Quest).where(Quest.user_id == user.id, Quest.status == "active")).all():
         if q.period_key != period_keys[q.timeframe]: q.status = "expired"
@@ -313,7 +336,7 @@ def quests(request: Request, session: Session = Depends(db_session)):
     user = get_user(request, session)
     ensure_quests(user, session)
     items = session.scalars(select(Quest).where(Quest.user_id == user.id, Quest.period_key.in_([current_period_key(f, user.timezone) for f in QUESTS])).order_by(Quest.id)).all()
-    return [{"id": q.id, "title": q.title, "description": q.description, "timeframe": q.timeframe, "difficulty": q.difficulty, "xp": max(5, q.base_xp // (2 ** q.rerolls)), "status": q.status, "rerolls": q.rerolls, "progress": q.progress, "due_at": q.due_at.isoformat() if q.due_at else None} for q in items]
+    return [{"id": q.id, "title": q.title, "description": q.description, "timeframe": q.timeframe, "category": q.category, "estimated_minutes": q.estimated_minutes, "difficulty": q.difficulty, "xp": max(5, q.base_xp // (2 ** q.rerolls)), "status": q.status, "rerolls": q.rerolls, "progress": q.progress, "due_at": q.due_at.isoformat() if q.due_at else None} for q in items]
 
 
 @app.post("/api/quests/{quest_id}/complete")
@@ -354,8 +377,23 @@ def update_progress(quest_id: int, payload: dict, request: Request, session: Ses
 
 
 def _award_achievements(user: User, session: Session):
-    completed = session.scalar(select(Quest).where(Quest.user_id == user.id, Quest.status == "completed").count()) if False else len(session.scalars(select(Quest).where(Quest.user_id == user.id, Quest.status == "completed")).all())
-    definitions = [("first_quest", "First Steps", "Complete your first quest.", completed >= 1), ("quest_10", "Quest Collector", "Complete ten quests.", completed >= 10), ("monthly_quest", "Long Game", "Complete a monthly quest.", any(q.timeframe == "monthly" for q in session.scalars(select(Quest).where(Quest.user_id == user.id, Quest.status == "completed")).all()))]
+    completed_quests = session.scalars(select(Quest).where(Quest.user_id == user.id, Quest.status == "completed")).all()
+    completed = len(completed_quests)
+    dates = sorted({q.completed_at.date() for q in completed_quests if q.completed_at}, reverse=True)
+    seven_day_streak = False
+    if dates:
+        expected = dates[0]; run = 0
+        for day in dates:
+            if day == expected: run += 1; expected -= timedelta(days=1)
+            else: break
+        seven_day_streak = run >= 7
+    definitions = [
+        ("first_quest", "First Steps", "Complete your first quest.", completed >= 1),
+        ("quest_10", "Quest Collector", "Complete ten quests.", completed >= 10),
+        ("quest_100", "Century Club", "Complete one hundred quests.", completed >= 100),
+        ("seven_day_streak", "Steady Adventurer", "Complete a quest on seven consecutive days.", seven_day_streak),
+        ("monthly_quest", "Long Game", "Complete a monthly quest.", any(q.timeframe == "monthly" for q in completed_quests)),
+    ]
     for key, name, desc, earned in definitions:
         ach = session.scalar(select(Achievement).where(Achievement.key == key))
         if not ach:
@@ -366,7 +404,9 @@ def _award_achievements(user: User, session: Session):
 
 @app.get("/api/history")
 def history(request: Request, session: Session = Depends(db_session)):
-    user = get_user(request, session); return [{"id":q.id,"title":q.title,"timeframe":q.timeframe,"status":q.status,"xp":q.base_xp,"completed_at":q.completed_at.isoformat() if q.completed_at else None} for q in session.scalars(select(Quest).where(Quest.user_id == user.id).order_by(Quest.id.desc()).limit(100)).all()]
+    user = get_user(request, session)
+    ledger = {x.quest_id: x.amount for x in session.scalars(select(XpLedger).where(XpLedger.user_id == user.id)).all()}
+    return [{"id":q.id,"title":q.title,"timeframe":q.timeframe,"status":q.status,"xp":ledger.get(q.id, 0),"completed_at":q.completed_at.isoformat() if q.completed_at else None} for q in session.scalars(select(Quest).where(Quest.user_id == user.id).order_by(Quest.id.desc()).limit(100)).all()]
 
 
 @app.get("/api/achievements")
