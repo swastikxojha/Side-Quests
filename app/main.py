@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from secrets import randbelow
 from hashlib import sha256
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse
@@ -33,6 +34,7 @@ class User(Base):
     email: Mapped[str] = mapped_column(String(255), unique=True, index=True)
     password_hash: Mapped[str] = mapped_column(String(255))
     xp: Mapped[int] = mapped_column(Integer, default=0)
+    timezone: Mapped[str] = mapped_column(String(64), default="UTC")
 
 
 class Quest(Base):
@@ -52,6 +54,7 @@ class Quest(Base):
     progress: Mapped[int] = mapped_column(Integer, default=0)
     status: Mapped[str] = mapped_column(String(20), default="active")
     assigned_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    due_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
@@ -99,6 +102,13 @@ class UserAchievement(Base):
     unlocked_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 
+class RateLimit(Base):
+    __tablename__ = "rate_limits"
+    key: Mapped[str] = mapped_column(String(128), primary_key=True)
+    window_start: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+
+
 def db_session():
     with SessionLocal() as session:
         yield session
@@ -135,11 +145,38 @@ class ResetInput(BaseModel):
     new_password: str = Field(min_length=8, max_length=128)
 
 
+class ProfileInput(BaseModel):
+    username: str | None = Field(default=None, min_length=2, max_length=40)
+    timezone: str | None = None
+
+
+class PasswordChange(BaseModel):
+    current_password: str
+    new_password: str = Field(min_length=8, max_length=128)
+
+
+def rate_limit(session: Session, request: Request, action: str, limit: int, seconds: int = 900):
+    now = datetime.now(timezone.utc)
+    ip = request.client.host if request.client else "unknown"
+    key = f"{action}:{ip}"
+    record = session.get(RateLimit, key)
+    if record:
+        start = record.window_start if record.window_start.tzinfo else record.window_start.replace(tzinfo=timezone.utc)
+        if now - start >= timedelta(seconds=seconds): record.window_start, record.attempts = now, 1
+        else:
+            record.attempts += 1
+            if record.attempts > limit:
+                session.commit()
+                raise HTTPException(429, "Too many attempts. Please try again later.", headers={"Retry-After": str(seconds)})
+    else: session.add(RateLimit(key=key, window_start=now, attempts=1))
+    session.commit()
+
+
 @app.on_event("startup")
 def startup():
     if os.getenv("APP_ENV", "development") == "production" and (not os.getenv("SECRET_KEY") or os.getenv("SECRET_KEY") == "dev-only-change-me"):
         raise RuntimeError("Set a strong SECRET_KEY before production startup")
-    if os.getenv("APP_ENV", "development") != "production":
+    if os.getenv("APP_ENV", "development") != "production" and os.getenv("APP_AUTO_CREATE_SCHEMA", "true").lower() == "true":
         Base.metadata.create_all(engine)
 
 
@@ -155,9 +192,11 @@ def get_user(request, session: Session) -> User:
     from hmac import new, compare_digest
     token = request.cookies.get("sq_session", "")
     try:
-        uid, sig = token.split(".", 1)
-        expected = new(os.getenv("SECRET_KEY", "dev-only-change-me").encode(), uid.encode(), "sha256").hexdigest()
+        uid, expires, sig = token.split(".", 2)
+        signed = f"{uid}.{expires}"
+        expected = new(os.getenv("SECRET_KEY", "dev-only-change-me").encode(), signed.encode(), "sha256").hexdigest()
         if not compare_digest(sig, expected): raise ValueError()
+        if int(expires) < int(datetime.now(timezone.utc).timestamp()): raise ValueError()
         user = session.get(User, int(uid))
         if user: return user
     except Exception: pass
@@ -167,12 +206,24 @@ def get_user(request, session: Session) -> User:
 def issue_cookie(response: Response, user: User):
     from hmac import new
     uid = str(user.id)
-    sig = new(os.getenv("SECRET_KEY", "dev-only-change-me").encode(), uid.encode(), "sha256").hexdigest()
-    response.set_cookie("sq_session", f"{uid}.{sig}", httponly=True, samesite="lax", secure=os.getenv("COOKIE_SECURE", "false").lower() == "true", max_age=60 * 60 * 24 * 7)
+    expires = str(int(datetime.now(timezone.utc).timestamp()) + 60 * 60 * 24 * 7)
+    signed = f"{uid}.{expires}"
+    sig = new(os.getenv("SECRET_KEY", "dev-only-change-me").encode(), signed.encode(), "sha256").hexdigest()
+    response.set_cookie("sq_session", f"{signed}.{sig}", httponly=True, samesite="lax", secure=os.getenv("COOKIE_SECURE", "false").lower() == "true", max_age=60 * 60 * 24 * 7)
+
+
+def level_stats(total_xp: int):
+    level = 1
+    while total_xp >= 500 * level * level: level += 1
+    lower = 500 * (level - 1) ** 2
+    upper = 500 * level ** 2
+    names = ["Novice", "Explorer", "Adventurer", "Challenger", "Veteran", "Elite", "Master"]
+    return {"level": level, "rank": names[min(level - 1, len(names) - 1)], "xp_into_level": total_xp - lower, "xp_for_level": upper - lower}
 
 
 @app.post("/api/auth/register", status_code=201)
-def register(data: Signup, response: Response, session: Session = Depends(db_session)):
+def register(data: Signup, request: Request, response: Response, session: Session = Depends(db_session)):
+    rate_limit(session, request, "register", 10)
     email = str(data.email).lower()
     if session.scalar(select(User).where(User.email == email)): raise HTTPException(409, "Email is already registered")
     user = User(username=data.username.strip(), email=email, password_hash=passwords.hash(data.password))
@@ -181,7 +232,8 @@ def register(data: Signup, response: Response, session: Session = Depends(db_ses
 
 
 @app.post("/api/auth/login")
-def login(data: AuthInput, response: Response, session: Session = Depends(db_session)):
+def login(data: AuthInput, request: Request, response: Response, session: Session = Depends(db_session)):
+    rate_limit(session, request, "login", 10)
     user = session.scalar(select(User).where(User.email == str(data.email).lower()))
     if not user or not passwords.verify(data.password, user.password_hash): raise HTTPException(401, "Email or password is incorrect")
     issue_cookie(response, user); return {"id": user.id, "username": user.username}
@@ -200,13 +252,14 @@ def me(request: Request, session: Session = Depends(db_session)):
     streak = 0
     if days:
         from datetime import date
-        expected = date.today()
-        if days[0] < expected: expected = days[0]
-        for day in days:
-            if day == expected: streak += 1; expected -= timedelta(days=1)
-            else: break
+        local_today = datetime.now(ZoneInfo(user.timezone)).date()
+        if days[0] in (local_today, local_today - timedelta(days=1)):
+            expected = days[0]
+            for day in days:
+                if day == expected: streak += 1; expected -= timedelta(days=1)
+                else: break
     interests = [i.name for i in session.scalars(select(UserInterest).where(UserInterest.user_id == user.id)).all()]
-    return {"id": user.id, "username": user.username, "xp": user.xp, "level": user.xp // 500 + 1, "xp_into_level": user.xp % 500, "rank": ["Novice", "Explorer", "Adventurer", "Challenger", "Veteran", "Elite", "Master"][min(user.xp // 500, 6)], "streak": streak, "completed_count": len(completed), "interests": interests}
+    return {"id": user.id, "username": user.username, "xp": user.xp, **level_stats(user.xp), "streak": streak, "completed_count": len(completed), "interests": interests, "timezone": user.timezone}
 
 
 QUESTS = {
@@ -216,25 +269,38 @@ QUESTS = {
 }
 
 
-def current_period_key(frame: str) -> str:
+def current_period_key(frame: str, timezone_name: str = "UTC") -> str:
     from datetime import date
-    today = date.today()
+    try: today = datetime.now(ZoneInfo(timezone_name)).date()
+    except ZoneInfoNotFoundError: today = datetime.now(timezone.utc).date()
     if frame == "daily": return today.isoformat()
     if frame == "weekly":
         iso = today.isocalendar(); return f"{iso.year}-W{iso.week:02d}"
     return today.strftime("%Y-%m")
 
 
+def period_due_at(frame: str, timezone_name: str) -> datetime:
+    from datetime import date, time
+    zone = ZoneInfo(timezone_name)
+    today = datetime.now(zone).date()
+    if frame == "daily": end = today + timedelta(days=1)
+    elif frame == "weekly": end = today + timedelta(days=7-today.weekday())
+    else:
+        end = today.replace(day=28) + timedelta(days=4)
+        end = end.replace(day=1)
+    return datetime.combine(end, time.min, tzinfo=zone).astimezone(timezone.utc)
+
+
 def ensure_quests(user: User, session: Session):
     from datetime import date
-    period_keys = {frame: current_period_key(frame) for frame in QUESTS}
+    period_keys = {frame: current_period_key(frame, user.timezone) for frame in QUESTS}
     existing = {(q.timeframe, q.period_key, q.slot) for q in session.scalars(select(Quest).where(Quest.user_id == user.id)).all()}
     interests = [i.name for i in session.scalars(select(UserInterest).where(UserInterest.user_id == user.id)).all()] or ["Curiosity"]
     for frame, rows in QUESTS.items():
         key = period_keys[frame]
         for slot, (title, desc, xp) in enumerate(rows):
             if (frame, key, slot) not in existing:
-                session.add(Quest(user_id=user.id, title=title.replace("your", interests[slot % len(interests)]), description=desc, timeframe=frame, period_key=key, slot=slot, base_xp=xp))
+                session.add(Quest(user_id=user.id, title=title.replace("your", interests[slot % len(interests)]), description=desc, timeframe=frame, period_key=key, slot=slot, base_xp=xp, due_at=period_due_at(frame, user.timezone)))
     # Expire old active assignments and preserve them in history.
     for q in session.scalars(select(Quest).where(Quest.user_id == user.id, Quest.status == "active")).all():
         if q.period_key != period_keys[q.timeframe]: q.status = "expired"
@@ -246,8 +312,8 @@ def ensure_quests(user: User, session: Session):
 def quests(request: Request, session: Session = Depends(db_session)):
     user = get_user(request, session)
     ensure_quests(user, session)
-    items = session.scalars(select(Quest).where(Quest.user_id == user.id, Quest.period_key.in_([current_period_key(f) for f in QUESTS])).order_by(Quest.id)).all()
-    return [{"id": q.id, "title": q.title, "description": q.description, "timeframe": q.timeframe, "difficulty": q.difficulty, "xp": max(5, q.base_xp // (2 ** q.rerolls)), "status": q.status, "rerolls": q.rerolls} for q in items]
+    items = session.scalars(select(Quest).where(Quest.user_id == user.id, Quest.period_key.in_([current_period_key(f, user.timezone) for f in QUESTS])).order_by(Quest.id)).all()
+    return [{"id": q.id, "title": q.title, "description": q.description, "timeframe": q.timeframe, "difficulty": q.difficulty, "xp": max(5, q.base_xp // (2 ** q.rerolls)), "status": q.status, "rerolls": q.rerolls, "progress": q.progress, "due_at": q.due_at.isoformat() if q.due_at else None} for q in items]
 
 
 @app.post("/api/quests/{quest_id}/complete")
@@ -259,7 +325,7 @@ def complete(quest_id: int, request: Request, session: Session = Depends(db_sess
     reward = max(5, q.base_xp // (2 ** q.rerolls)); q.status = "completed"; q.completed_at = datetime.now(timezone.utc); user.xp += reward
     session.add(XpLedger(user_id=user.id, quest_id=q.id, amount=reward, reason="quest_completion"))
     _award_achievements(user, session)
-    session.commit(); return {"xp_earned": reward, "total_xp": user.xp, "level": user.xp // 500 + 1}
+    session.commit(); return {"xp_earned": reward, "total_xp": user.xp, **level_stats(user.xp)}
 
 
 @app.post("/api/quests/{quest_id}/reroll")
@@ -273,7 +339,7 @@ def reroll(quest_id: int, request: Request, session: Session = Depends(db_sessio
     q.status = "rerolled"
     pool = QUESTS[q.timeframe]
     candidate = pool[(q.slot + q.generation + q.rerolls) % len(pool)]
-    replacement = Quest(user_id=user.id, title=candidate[0], description=candidate[1], timeframe=q.timeframe, period_key=q.period_key, slot=q.slot, generation=q.generation + 1, difficulty="Medium", base_xp=q.base_xp, rerolls=q.rerolls)
+    replacement = Quest(user_id=user.id, title=candidate[0], description=candidate[1], timeframe=q.timeframe, period_key=q.period_key, slot=q.slot, generation=q.generation + 1, difficulty="Medium", base_xp=q.base_xp, rerolls=q.rerolls, due_at=q.due_at)
     session.add(replacement); session.commit(); session.refresh(replacement)
     return {"rerolls": q.rerolls, "xp": new_reward, "replacement_id": replacement.id}
 
@@ -310,7 +376,8 @@ def achievements(request: Request, session: Session = Depends(db_session)):
 
 
 @app.post("/api/auth/forgot-password")
-def forgot(data: ForgotInput, session: Session = Depends(db_session)):
+def forgot(data: ForgotInput, request: Request, session: Session = Depends(db_session)):
+    rate_limit(session, request, "forgot", 5)
     # Generic response avoids revealing whether an account exists.
     email = str(data.email).lower()
     if email:
@@ -332,7 +399,8 @@ def forgot(data: ForgotInput, session: Session = Depends(db_session)):
 
 
 @app.post("/api/auth/reset-password")
-def reset_password(data: ResetInput, session: Session = Depends(db_session)):
+def reset_password(data: ResetInput, request: Request, session: Session = Depends(db_session)):
+    rate_limit(session, request, "reset", 8)
     user = session.scalar(select(User).where(User.email == str(data.email).lower()))
     if not user: raise HTTPException(400, "Invalid or expired reset code")
     rows = session.scalars(select(ResetCode).where(ResetCode.user_id == user.id, ResetCode.used.is_(False)).order_by(ResetCode.id.desc())).all()
@@ -365,3 +433,44 @@ def set_interests(data: InterestInput, request: Request, session: Session = Depe
     session.add_all([UserInterest(user_id=user.id, name=n[:40]) for n in names])
     session.commit()
     return {"interests": names}
+
+
+@app.patch("/api/profile")
+def update_profile(data: ProfileInput, request: Request, session: Session = Depends(db_session)):
+    user = get_user(request, session)
+    if data.username is not None: user.username = data.username.strip()
+    if data.timezone is not None:
+        try: ZoneInfo(data.timezone)
+        except ZoneInfoNotFoundError: raise HTTPException(422, "Choose a valid IANA timezone, such as Europe/London")
+        user.timezone = data.timezone
+    session.commit()
+    return {"username": user.username, "timezone": user.timezone}
+
+
+@app.post("/api/auth/change-password")
+def change_password(data: PasswordChange, request: Request, session: Session = Depends(db_session)):
+    user = get_user(request, session)
+    if not passwords.verify(data.current_password, user.password_hash): raise HTTPException(400, "Current password is incorrect")
+    user.password_hash = passwords.hash(data.new_password)
+    session.commit()
+    return {"message": "Password updated"}
+
+
+@app.delete("/api/me", status_code=204)
+def delete_account(request: Request, response: Response, session: Session = Depends(db_session)):
+    user = get_user(request, session)
+    for model in (UserAchievement, XpLedger, ResetCode, UserInterest, Quest):
+        session.query(model).filter_by(user_id=user.id).delete(synchronize_session=False)
+    session.delete(user); session.commit(); response.delete_cookie("sq_session")
+    return Response(status_code=204)
+
+
+@app.get("/api/progress/stats")
+def progress_stats(request: Request, session: Session = Depends(db_session)):
+    user = get_user(request, session)
+    quests = session.scalars(select(Quest).where(Quest.user_id == user.id)).all()
+    summary = {}
+    for frame in QUESTS:
+        group = [q for q in quests if q.timeframe == frame]
+        summary[frame] = {"assigned": len(group), "completed": sum(q.status == "completed" for q in group), "expired": sum(q.status == "expired" for q in group)}
+    return {"total_xp": user.xp, "levels": level_stats(user.xp), "timeframes": summary, "xp_history": [{"amount": x.amount, "reason": x.reason, "created_at": x.created_at.isoformat()} for x in session.scalars(select(XpLedger).where(XpLedger.user_id == user.id).order_by(XpLedger.id.desc()).limit(50)).all()]}

@@ -24,8 +24,8 @@ See `.env.example`. Configure `DATABASE_URL`, `SECRET_KEY`, `COOKIE_SECURE`, `AP
 
 ## Included features
 
-Account registration/login, Argon2id password hashes, email-or-development-log password reset OTPs, interest selection, daily/weekly/monthly quest assignment, rerolls, progress, completion, XP/levels/ranks, streak display, history, starter achievements, responsive dashboard, PostgreSQL Compose setup, Alembic migrations, and a basic CI workflow.
+Account registration/login, Argon2id password hashes, rate-limited authentication and password reset OTPs, email-or-development-log OTP delivery, interest selection, timezone-aware daily/weekly/monthly quest assignment and due dates, rerolls, progress, completion, XP/levels/ranks, streak display, history, starter achievements, profile and password settings, account deletion, responsive dashboard, PostgreSQL Compose setup, Alembic migrations, and a basic CI workflow.
 
 ## Deployment notes
 
-Use HTTPS, set `APP_ENV=production`, configure a high-entropy `SECRET_KEY`, set `COOKIE_SECURE=true`, replace the development database credentials, configure SMTP, and restrict network access to PostgreSQL. Review rate limits and monitoring before public launch. This starter does not yet include a dedicated rate-limiting backend, verified account email, account deletion workflow, or external production hosting configuration.
+Use HTTPS, set `APP_ENV=production`, configure a high-entropy `SECRET_KEY`, set `COOKIE_SECURE=true`, replace the development database credentials, configure SMTP, and restrict network access to PostgreSQL. Rate-limit counters are database-backed. The application does not yet include verified account email or external production hosting configuration. Review security settings and monitoring before public launch.
