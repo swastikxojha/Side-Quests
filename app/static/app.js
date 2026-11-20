@@ -52,6 +52,10 @@ document.querySelectorAll(".tab").forEach((tab) => {
     $("[name=username]").required = authMode === "register";
     $("[name=password]").autocomplete = authMode === "login" ? "current-password" : "new-password";
     $("#auth-submit").innerHTML = `${authMode === "login" ? "Sign in" : "Create account"} <span>→</span>`;
+    $(".auth-form-heading h2").textContent = authMode === "login" ? "Welcome back" : "Start your adventure";
+    $(".auth-form-heading p").textContent = authMode === "login"
+      ? "Sign in and pick up where you left off."
+      : "A few details, then your next chapter begins.";
     $("#auth-message").textContent = "";
   });
 });
